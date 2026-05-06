@@ -7,24 +7,19 @@ upstream app_backend {
 server {
     listen {{ nginx.port }};
 
-    # Timeouts from manifest
     proxy_connect_timeout {{ nginx.proxy_timeout }}s;
     proxy_send_timeout    {{ nginx.proxy_timeout }}s;
     proxy_read_timeout    {{ nginx.proxy_timeout }}s;
 
-    # Required headers
     add_header X-Deployed-By swiftdeploy always;
 
     location / {
         proxy_pass http://app_backend;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-
-        # Forward X-Mode header from upstream (canary mode)
         proxy_pass_header X-Mode;
     }
 
-    # JSON error pages
     error_page 502 = @error502;
     error_page 503 = @error503;
     error_page 504 = @error504;

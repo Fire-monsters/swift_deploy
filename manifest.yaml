@@ -1,15 +1,20 @@
 services:
   image: swift-deploy-1-node:latest
   port: 3000
-  mode: canary
+  mode: stable
   version: "1.0.0"
   restart_policy: unless-stopped
-  log_volume: app_logs   # named volume for logs
+  log_volume: app_logs
 
 nginx:
   image: nginx:latest
   port: 8080
-  proxy_timeout: 30      # seconds
+  proxy_timeout: 30   #30 seconds
+
+
+opa:
+  image: openpolicyagent/opa:latest
+  port: 8181
 
 network:
   name: swiftdeploy-net

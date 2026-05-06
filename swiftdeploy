@@ -2,39 +2,43 @@
 """
 swiftdeploy — CLI tool that manages the entire stack lifecycle
 Usage:
-    ./swiftdeploy init
-    ./swiftdeploy validate
-    ./swiftdeploy deploy
-    ./swiftdeploy promote canary
-    ./swiftdeploy promote stable
-    ./swiftdeploy teardown
-    ./swiftdeploy teardown --clean
+  ./swiftdeploy init
+  ./swiftdeploy validate
+  ./swiftdeploy deploy
+  ./swiftdeploy promote canary
+  ./swiftdeploy promote stable
+  ./swiftdeploy status
+  ./swiftdeploy audit
+  ./swiftdeploy teardown
+  ./swiftdeploy teardown --clean
 """
 
 import sys
 import os
 import subprocess
 import socket
+import json
+import time
+import re
+import datetime
+import threading
 import yaml
 from jinja2 import Template
 
 # ─────────────────────────────────────────
-# HELPER FUNCTIONS
+# HELPERS
 # ─────────────────────────────────────────
 
 def load_manifest():
-    """Read and parse manifest.yaml"""
     with open("manifest.yaml", "r") as f:
         return yaml.safe_load(f)
 
 def render_template(template_path, context):
-    """Fill in a .j2 template with values from manifest"""
     with open(template_path, "r") as f:
         template = Template(f.read())
     return template.render(**context)
 
 def run(command, check=True):
-    """Run a shell command and return output"""
     result = subprocess.run(
         command, shell=True,
         capture_output=True, text=True
@@ -51,31 +55,247 @@ def print_step(msg):
     print(f"{'─'*50}")
 
 # ─────────────────────────────────────────
+# METRICS PARSER
+# Reads raw Prometheus text and extracts values
+# ─────────────────────────────────────────
+
+def scrape_metrics(port):
+    """
+    Fetches /metrics and returns parsed dict.
+    Returns None if unreachable.
+    """
+    try:
+        import urllib.request
+        url = f"http://localhost:{port}/metrics"
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return r.read().decode()
+    except Exception:
+        return None
+
+def parse_counter(metrics_text, name, labels=None):
+    """Extract a counter value from Prometheus text"""
+    if not metrics_text:
+        return 0
+    total = 0
+    for line in metrics_text.splitlines():
+        if line.startswith("#"):
+            continue
+        if not line.startswith(name):
+            continue
+        if labels:
+            if all(f'{k}="{v}"' in line for k, v in labels.items()):
+                val = float(line.split()[-1])
+                total += val
+        else:
+            val = float(line.split()[-1])
+            total += val
+    return total
+
+def calculate_error_rate(metrics_text):
+    """
+    Error rate = 5xx requests / total requests
+    Returns float between 0 and 1
+    """
+    total = 0
+    errors = 0
+    if not metrics_text:
+        return 0.0
+    for line in metrics_text.splitlines():
+        if line.startswith("#") or not line.startswith("http_requests_total"):
+            continue
+        val = float(line.split()[-1])
+        total += val
+        if '"5' in line:   # status_code starts with 5
+            errors += val
+    if total == 0:
+        return 0.0
+    return errors / total
+
+def calculate_p99_latency(metrics_text):
+    """
+    P99 latency from histogram buckets.
+    Finds the smallest bucket where count >= 99% of total.
+    Returns milliseconds.
+    """
+    if not metrics_text:
+        return 0.0
+
+    buckets = []
+    total_count = 0
+
+    for line in metrics_text.splitlines():
+        if line.startswith("#"):
+            continue
+        if "http_request_duration_seconds_bucket" not in line:
+            continue
+        le_match = re.search(r'le="([^"]+)"', line)
+        if not le_match:
+            continue
+        le = le_match.group(1)
+        val = float(line.split()[-1])
+        if le == "+Inf":
+            total_count = val
+        else:
+            buckets.append((float(le), val))
+
+    if total_count == 0:
+        return 0.0
+
+    target = total_count * 0.99
+    for le, count in sorted(buckets):
+        if count >= target:
+            return le * 1000  # convert seconds to ms
+
+    return buckets[-1][0] * 1000 if buckets else 0.0
+
+def get_host_stats():
+    """Get disk, CPU, memory stats from the host"""
+    import shutil
+    import psutil
+
+    disk = shutil.disk_usage("/")
+    disk_free_gb = disk.free / (1024 ** 3)
+
+    cpu_load = os.getloadavg()[0]  # 1-minute load average
+
+    mem = psutil.virtual_memory()
+    mem_percent = mem.percent
+
+    return {
+        "disk_free_gb": round(disk_free_gb, 2),
+        "cpu_load": round(cpu_load, 2),
+        "mem_percent": round(mem_percent, 1),
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+    }
+
+# ─────────────────────────────────────────
+# OPA POLICY ENGINE
+# ─────────────────────────────────────────
+
+def query_opa(opa_port, package, input_data):
+    """
+    Send input to OPA and get decision back.
+    Returns dict with allow, violations, domain.
+    Never crashes — returns error state if OPA unreachable.
+    """
+    import urllib.request
+    import urllib.error
+
+    url = f"http://localhost:{opa_port}/v1/data/{package}/decision"
+    payload = json.dumps({"input": input_data}).encode()
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            response = json.loads(r.read().decode())
+            # OPA wraps result in {"result": {...}}
+            return response.get("result", {})
+
+    except urllib.error.URLError:
+        # OPA is unreachable
+        return {
+            "allow": False,
+            "violations": ["OPA is unreachable — cannot make policy decision"],
+            "domain": package,
+            "error": "opa_unreachable"
+        }
+    except urllib.error.HTTPError as e:
+        # OPA returned an error (e.g. policy not found)
+        return {
+            "allow": False,
+            "violations": [f"OPA returned HTTP {e.code} — check policy syntax"],
+            "domain": package,
+            "error": "opa_http_error"
+        }
+    except Exception as e:
+        # Any other failure
+        return {
+            "allow": False,
+            "violations": [f"Unexpected OPA error: {str(e)}"],
+            "domain": package,
+            "error": "opa_unknown_error"
+        }
+
+def run_policy_checks(checks):
+    """
+    Run multiple OPA policy checks.
+    Each check is a dict: {name, package, input}
+    Returns True if ALL pass, False if any fail.
+    Prints clear pass/fail for each domain.
+    """
+    all_passed = True
+    print("\n  Policy checks:")
+
+    for check in checks:
+        decision = query_opa(
+            check["opa_port"],
+            check["package"],
+            check["input"]
+        )
+
+        allowed = decision.get("allow", False)
+        violations = decision.get("violations", [])
+        domain = decision.get("domain", check["package"])
+        error = decision.get("error")
+
+        if error == "opa_unreachable":
+            print(f"  ⚠️  [{domain}] OPA unreachable — policy check skipped")
+            print(f"      Warning: Proceeding without policy enforcement")
+            # Don't block on OPA being down — warn but continue
+            continue
+
+        if allowed:
+            print(f"  ✅ [{domain}] Policy check passed")
+        else:
+            print(f"  ❌ [{domain}] Policy check FAILED")
+            for v in violations:
+                print(f"      → {v}")
+            all_passed = False
+
+    return all_passed
+
+# ─────────────────────────────────────────
+# AUDIT TRAIL
+# ─────────────────────────────────────────
+
+HISTORY_FILE = "history.jsonl"
+
+def append_history(event_type, data):
+    """Append an event to history.jsonl for audit trail"""
+    entry = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "event": event_type,
+        "data": data
+    }
+    with open(HISTORY_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+# ─────────────────────────────────────────
 # SUBCOMMAND: init
 # ─────────────────────────────────────────
 
 def cmd_init():
-    """
-    Reads manifest.yaml and generates:
-    - nginx.conf
-    - docker-compose.yml
-    """
     print_step("swiftdeploy init — generating configs from manifest")
-
     manifest = load_manifest()
 
-    # Generate nginx.conf from template
     nginx_conf = render_template("templates/nginx.conf.j2", manifest)
     with open("nginx.conf", "w") as f:
         f.write(nginx_conf)
     print("✅ Generated nginx.conf")
 
-    # Generate docker-compose.yml from template
     compose = render_template("templates/docker-compose.yml.j2", manifest)
     with open("docker-compose.yml", "w") as f:
         f.write(compose)
     print("✅ Generated docker-compose.yml")
 
+    # Ensure policies directory exists
+    os.makedirs("policies", exist_ok=True)
+    print("✅ Confirmed policies/ directory exists")
     print("\n✅ Init complete — configs generated from manifest.yaml")
 
 # ─────────────────────────────────────────
@@ -83,33 +303,23 @@ def cmd_init():
 # ─────────────────────────────────────────
 
 def cmd_validate():
-    """
-    5 pre-flight checks before deploying:
-    1. manifest.yaml exists and is valid YAML
-    2. Required fields are present
-    3. Docker image exists locally
-    4. Nginx port is not already bound
-    5. nginx.conf is syntactically valid
-    """
     print_step("swiftdeploy validate — running pre-flight checks")
     passed = 0
     failed = 0
 
-    # CHECK 1: manifest.yaml exists and is valid YAML
+    # CHECK 1: manifest.yaml valid
     try:
         manifest = load_manifest()
         print("✅ Check 1: manifest.yaml exists and is valid YAML")
         passed += 1
     except FileNotFoundError:
         print("❌ Check 1: manifest.yaml not found")
-        failed += 1
         sys.exit(1)
     except yaml.YAMLError as e:
         print(f"❌ Check 1: manifest.yaml is invalid YAML — {e}")
-        failed += 1
         sys.exit(1)
 
-    # CHECK 2: Required fields exist and are not empty
+    # CHECK 2: Required fields
     required = [
         ("services.image", manifest.get("services", {}).get("image")),
         ("services.port",  manifest.get("services", {}).get("port")),
@@ -117,6 +327,8 @@ def cmd_validate():
         ("nginx.port",     manifest.get("nginx", {}).get("port")),
         ("network.name",   manifest.get("network", {}).get("name")),
         ("network.driver_type", manifest.get("network", {}).get("driver_type")),
+        ("opa.image",      manifest.get("opa", {}).get("image")),
+        ("opa.port",       manifest.get("opa", {}).get("port")),
     ]
     missing = [k for k, v in required if not v]
     if missing:
@@ -126,7 +338,7 @@ def cmd_validate():
         print("✅ Check 2: All required fields present")
         passed += 1
 
-    # CHECK 3: Docker image exists locally
+    # CHECK 3: Docker image exists
     image = manifest["services"]["image"]
     result = run(f"docker image inspect {image}", check=False)
     if result.returncode == 0:
@@ -137,7 +349,7 @@ def cmd_validate():
         print(f"   Run: docker build -t {image} ./app")
         failed += 1
 
-    # CHECK 4: Nginx port is not already bound
+    # CHECK 4: Nginx port available
     nginx_port = manifest["nginx"]["port"]
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(1)
@@ -145,31 +357,21 @@ def cmd_validate():
     sock.close()
     if result_conn == 0:
         print(f"❌ Check 4: Port {nginx_port} is already in use")
-        print(f"   Run: lsof -i :{nginx_port} then kill -9 <PID>")
         failed += 1
     else:
         print(f"✅ Check 4: Port {nginx_port} is available")
         passed += 1
 
-    # CHECK 5: nginx.conf is syntactically valid
-    # We create a temporary copy with "app" replaced by "127.0.0.1"
-    # because "app" hostname only exists inside docker compose network
+    # CHECK 5: nginx.conf syntax valid
     if os.path.exists("nginx.conf"):
-        # Read the real nginx.conf
         with open("nginx.conf", "r") as f:
             nginx_content = f.read()
-
-        # Replace "app:PORT" with "127.0.0.1:PORT" for syntax check only
         test_content = nginx_content.replace(
             f"server app:{manifest['services']['port']}",
             f"server 127.0.0.1:{manifest['services']['port']}"
         )
-
-        # Write temporary test config
         with open("/tmp/nginx_test.conf", "w") as f:
             f.write(test_content)
-
-        # Validate syntax using temp config
         result = run(
             "docker run --rm "
             "-v /tmp/nginx_test.conf:/etc/nginx/conf.d/default.conf:ro "
@@ -187,7 +389,6 @@ def cmd_validate():
         print("⚠️  Check 5: nginx.conf not found — run init first")
         failed += 1
 
-    # Summary
     print(f"\n{'─'*50}")
     print(f"  Results: {passed} passed, {failed} failed")
     print(f"{'─'*50}")
@@ -200,57 +401,93 @@ def cmd_validate():
 # ─────────────────────────────────────────
 
 def cmd_deploy():
-    """
-    1. Runs init (generate configs)
-    2. Brings up the stack
-    3. Waits for health checks to pass (60s timeout)
-    """
     print_step("swiftdeploy deploy — bringing up the stack")
+    manifest = load_manifest()
+    opa_port = manifest["opa"]["port"]
+    nginx_port = manifest["nginx"]["port"]
 
-    # Generate configs first
+    # Generate configs
     cmd_init()
 
-    # Start containers in background
-    # Start app first, then nginx (which depends on app being healthy)
-    print("\n🚀 Starting containers...")
-    run("docker compose up -d app")
-    print("  App container started, waiting for health...")
+    # Start OPA first (needed for policy checks)
+    print("\n🔐 Starting OPA policy engine...")
+    run("docker compose up -d opa")
+    time.sleep(5)  # Give OPA time to load policies
 
-    # Wait for health checks (60 second timeout)
+    # PRE-DEPLOY POLICY CHECK
+    print_step("Pre-deploy policy check")
+    try:
+        host_stats = get_host_stats()
+        print(f"  Host stats:")
+        print(f"    Disk free:  {host_stats['disk_free_gb']}GB")
+        print(f"    CPU load:   {host_stats['cpu_load']}")
+        print(f"    Memory:     {host_stats['mem_percent']}%")
+
+        checks = [{
+            "name": "infrastructure",
+            "package": "policy/infrastructure",
+            "opa_port": opa_port,
+            "input": host_stats
+        }]
+
+        passed = run_policy_checks(checks)
+        if not passed:
+            print("\n❌ Pre-deploy policy check FAILED — deployment blocked")
+            print("   Fix the violations above and try again")
+            # Record violation in audit trail
+            append_history("deploy_blocked", {
+                "reason": "policy_violation",
+                "host_stats": host_stats
+            })
+            run("docker compose down", check=False)
+            sys.exit(1)
+
+        print("\n✅ Pre-deploy policy checks passed")
+
+    except ImportError:
+        print("⚠️  psutil not installed — skipping host stats check")
+        print("   Install with: pip install psutil --break-system-packages")
+
+    # Start app
+    print("\n🚀 Starting app container...")
+    run("docker compose up -d app")
+
+    # Wait for health
     print("\n⏳ Waiting for health checks to pass...")
-    import time
     timeout = 60
     start = time.time()
 
     while time.time() - start < timeout:
-        result = run("docker compose ps --format json", check=False)
-
-        # Check if app container is healthy
         health_result = run(
             "docker inspect --format='{{.State.Health.Status}}' "
             "$(docker compose ps -q app)",
             check=False
         )
-
         status = health_result.stdout.strip()
         elapsed = int(time.time() - start)
         print(f"  [{elapsed}s] Health status: {status}")
-        
+
         if status == "healthy":
-            # Now start nginx since app is confirmed healthy
             print("\n  App is healthy — starting nginx...")
             run("docker compose up -d nginx")
-            import time
-            time.sleep(3)  # Give nginx a moment to start
+            time.sleep(3)
+
+            # Record successful deploy
+            append_history("deploy_success", {
+                "mode": manifest["services"]["mode"],
+                "version": manifest["services"]["version"]
+            })
+
             print("\n✅ Stack is up and healthy!")
-            print(f"  → App (via nginx): http://localhost:{load_manifest()['nginx']['port']}")
-            print(f"  → Health check:    http://localhost:{load_manifest()['nginx']['port']}/healthz")
+            print(f"  → App (via nginx): http://localhost:{nginx_port}")
+            print(f"  → Health check:    http://localhost:{nginx_port}/healthz")
+            print(f"  → Metrics:         http://localhost:{nginx_port}/metrics")
             return
 
         time.sleep(5)
 
     print("❌ Health checks did not pass within 60 seconds")
-    print("   Run: docker compose logs app")
+    run("docker compose logs app", check=False)
     sys.exit(1)
 
 # ─────────────────────────────────────────
@@ -258,25 +495,56 @@ def cmd_deploy():
 # ─────────────────────────────────────────
 
 def cmd_promote(target_mode):
-    """
-    Switches between stable and canary mode:
-    1. Updates mode in manifest.yaml
-    2. Regenerates docker-compose.yml
-    3. Restarts ONLY the app container
-    4. Confirms new mode via /healthz
-    """
     if target_mode not in ("canary", "stable"):
         print("❌ Usage: ./swiftdeploy promote [canary|stable]")
         sys.exit(1)
 
     print_step(f"swiftdeploy promote — switching to {target_mode} mode")
+    manifest = load_manifest()
+    opa_port = manifest["opa"]["port"]
+    nginx_port = manifest["nginx"]["port"]
 
-    # Step 1: Update manifest.yaml in place
+    # PRE-PROMOTE POLICY CHECK (only when promoting to canary)
+    if target_mode == "canary":
+        print_step("Pre-promote canary safety check")
+
+        metrics_text = scrape_metrics(nginx_port)
+        if metrics_text:
+            error_rate = calculate_error_rate(metrics_text)
+            p99_latency = calculate_p99_latency(metrics_text)
+
+            print(f"  Current metrics:")
+            print(f"    Error rate:   {error_rate*100:.2f}%")
+            print(f"    P99 latency:  {p99_latency:.0f}ms")
+
+            checks = [{
+                "name": "canary",
+                "package": "policy/canary",
+                "opa_port": opa_port,
+                "input": {
+                    "error_rate": error_rate,
+                    "p99_latency_ms": p99_latency,
+                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+                }
+            }]
+
+            passed = run_policy_checks(checks)
+            if not passed:
+                print("\n❌ Canary safety check FAILED — promotion blocked")
+                append_history("promote_blocked", {
+                    "target_mode": target_mode,
+                    "error_rate": error_rate,
+                    "p99_latency_ms": p99_latency
+                })
+                sys.exit(1)
+
+            print("\n✅ Canary safety checks passed")
+        else:
+            print("⚠️  Could not scrape metrics — proceeding with caution")
+
+    # Update manifest.yaml mode in place
     with open("manifest.yaml", "r") as f:
         content = f.read()
-
-    # Replace the mode line
-    import re
     updated = re.sub(
         r"(^\s*mode:\s*).*$",
         f"\\g<1>{target_mode}",
@@ -287,46 +555,240 @@ def cmd_promote(target_mode):
         f.write(updated)
     print(f"✅ Updated manifest.yaml mode → {target_mode}")
 
-    # Step 2: Regenerate docker-compose.yml only
+    # Regenerate docker-compose.yml
     manifest = load_manifest()
     compose = render_template("templates/docker-compose.yml.j2", manifest)
     with open("docker-compose.yml", "w") as f:
         f.write(compose)
     print("✅ Regenerated docker-compose.yml")
 
-    # Step 3: Restart ONLY the app container (not nginx)
+    # Restart app only
     print("🔄 Restarting app container only...")
     run("docker compose up -d --no-deps app")
+    time.sleep(5)
 
-    # Step 4: Confirm new mode via /healthz
-    import time
-    time.sleep(5)  # Give container time to restart
-
-    nginx_port = manifest["nginx"]["port"]
+    # Confirm via healthz
     result = run(
         f"curl -s http://localhost:{nginx_port}/healthz",
         check=False
     )
     if result.returncode == 0:
         print(f"✅ Service responding after promote")
-        print(f"   /healthz response: {result.stdout}")
+        print(f"   /healthz: {result.stdout.strip()}")
     else:
         print("❌ Service not responding after promote")
         sys.exit(1)
 
+    # Record in audit trail
+    append_history("promote_success", {"mode": target_mode})
+
     print(f"\n✅ Promote complete — now running in {target_mode} mode")
+
+# ─────────────────────────────────────────
+# SUBCOMMAND: status
+# ─────────────────────────────────────────
+
+def cmd_status():
+    """
+    Live-refreshing terminal dashboard.
+    Shows metrics + policy compliance.
+    Appends every scrape to history.jsonl.
+    """
+    print_step("swiftdeploy status — live dashboard (Ctrl+C to exit)")
+    manifest = load_manifest()
+    nginx_port = manifest["nginx"]["port"]
+    opa_port = manifest["opa"]["port"]
+
+    try:
+        while True:
+            # Clear terminal
+            os.system("clear")
+
+            now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            print(f"{'─'*50}")
+            print(f"  SwiftDeploy Status Dashboard — {now}")
+            print(f"{'─'*50}")
+
+            # Scrape metrics
+            metrics_text = scrape_metrics(nginx_port)
+
+            if not metrics_text:
+                print("\n  ⚠️  Cannot reach app — is the stack running?")
+                print("  Run: ./swiftdeploy deploy")
+            else:
+                # Calculate values
+                error_rate = calculate_error_rate(metrics_text)
+                p99_latency = calculate_p99_latency(metrics_text)
+
+                # Get mode and chaos state
+                app_mode = parse_counter(metrics_text, "app_mode")
+                chaos_val = parse_counter(metrics_text, "chaos_active")
+                uptime = parse_counter(metrics_text, "app_uptime_seconds")
+
+                mode_str = "canary" if app_mode == 1 else "stable"
+                chaos_str = {0: "none", 1: "slow", 2: "error"}.get(
+                    int(chaos_val), "unknown"
+                )
+
+                print(f"\n  📊 Metrics")
+                print(f"    Mode:         {mode_str}")
+                print(f"    Uptime:       {uptime:.0f}s")
+                print(f"    Error rate:   {error_rate*100:.2f}%")
+                print(f"    P99 latency:  {p99_latency:.0f}ms")
+                print(f"    Chaos state:  {chaos_str}")
+
+                # Policy compliance check
+                print(f"\n  🔐 Policy Compliance")
+
+                # Infrastructure check
+                try:
+                    host_stats = get_host_stats()
+                    infra_decision = query_opa(
+                        opa_port,
+                        "policy/infrastructure",
+                        host_stats
+                    )
+                    if infra_decision.get("allow"):
+                        print(f"    ✅ Infrastructure policy: PASS")
+                    else:
+                        print(f"    ❌ Infrastructure policy: FAIL")
+                        for v in infra_decision.get("violations", []):
+                            print(f"       → {v}")
+                except Exception:
+                    print(f"    ⚠️  Infrastructure policy: UNAVAILABLE")
+
+                # Canary check
+                canary_decision = query_opa(
+                    opa_port,
+                    "policy/canary",
+                    {
+                        "error_rate": error_rate,
+                        "p99_latency_ms": p99_latency,
+                        "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+                    }
+                )
+                if canary_decision.get("error") == "opa_unreachable":
+                    print(f"    ⚠️  Canary policy: OPA UNREACHABLE")
+                elif canary_decision.get("allow"):
+                    print(f"    ✅ Canary policy: PASS")
+                else:
+                    print(f"    ❌ Canary policy: FAIL")
+                    for v in canary_decision.get("violations", []):
+                        print(f"       → {v}")
+
+                # Append to audit trail
+                append_history("status_scrape", {
+                    "error_rate": error_rate,
+                    "p99_latency_ms": p99_latency,
+                    "mode": mode_str,
+                    "chaos": chaos_str,
+                    "uptime": uptime
+                })
+
+            print(f"\n  Refreshing every 5s — Ctrl+C to exit")
+            time.sleep(5)
+
+    except KeyboardInterrupt:
+        print("\n\n  Dashboard stopped.")
+
+# ─────────────────────────────────────────
+# SUBCOMMAND: audit
+# ─────────────────────────────────────────
+
+def cmd_audit():
+    """
+    Reads history.jsonl and generates audit_report.md
+    """
+    print_step("swiftdeploy audit — generating audit report")
+
+    if not os.path.exists(HISTORY_FILE):
+        print("❌ No history.jsonl found — run status first to build history")
+        sys.exit(1)
+
+    events = []
+    with open(HISTORY_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                events.append(json.loads(line))
+
+    if not events:
+        print("❌ history.jsonl is empty")
+        sys.exit(1)
+
+    # Separate event types
+    deploys = [e for e in events if "deploy" in e["event"]]
+    promotes = [e for e in events if "promote" in e["event"]]
+    violations = [e for e in events if "blocked" in e["event"]]
+    scrapes = [e for e in events if e["event"] == "status_scrape"]
+
+    # Build markdown report
+    lines = []
+    lines.append("# SwiftDeploy Audit Report")
+    lines.append(f"\nGenerated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    lines.append(f"\nTotal events recorded: {len(events)}")
+
+    # Timeline table
+    lines.append("\n## Timeline\n")
+    lines.append("| Timestamp | Event | Details |")
+    lines.append("|-----------|-------|---------|")
+
+    for e in deploys + promotes:
+        ts = e["timestamp"]
+        event = e["event"]
+        details = json.dumps(e.get("data", {}))
+        lines.append(f"| {ts} | {event} | {details} |")
+
+    # Violations section
+    lines.append("\n## Policy Violations\n")
+    if violations:
+        lines.append("| Timestamp | Type | Reason |")
+        lines.append("|-----------|------|--------|")
+        for e in violations:
+            ts = e["timestamp"]
+            reason = e.get("data", {}).get("reason", "unknown")
+            lines.append(f"| {ts} | {e['event']} | {reason} |")
+    else:
+        lines.append("_No policy violations recorded._")
+
+    # Metrics summary from scrapes
+    if scrapes:
+        lines.append("\n## Metrics Summary\n")
+        error_rates = [s["data"]["error_rate"] for s in scrapes]
+        latencies = [s["data"]["p99_latency_ms"] for s in scrapes]
+        lines.append(f"- Scrapes recorded: {len(scrapes)}")
+        lines.append(f"- Avg error rate: {sum(error_rates)/len(error_rates)*100:.2f}%")
+        lines.append(f"- Max P99 latency: {max(latencies):.0f}ms")
+        lines.append(f"- Avg P99 latency: {sum(latencies)/len(latencies):.0f}ms")
+
+        # Mode changes
+        mode_changes = [
+            s for i, s in enumerate(scrapes)
+            if i == 0 or s["data"]["mode"] != scrapes[i-1]["data"]["mode"]
+        ]
+        if mode_changes:
+            lines.append("\n### Mode Changes\n")
+            lines.append("| Timestamp | Mode |")
+            lines.append("|-----------|------|")
+            for s in mode_changes:
+                lines.append(f"| {s['timestamp']} | {s['data']['mode']} |")
+
+    # Write report
+    report = "\n".join(lines)
+    with open("audit_report.md", "w") as f:
+        f.write(report)
+
+    print("✅ audit_report.md generated")
+    print(f"   Events processed: {len(events)}")
+    print(f"   Violations found: {len(violations)}")
+    print(f"   View with: cat audit_report.md")
 
 # ─────────────────────────────────────────
 # SUBCOMMAND: teardown
 # ─────────────────────────────────────────
 
 def cmd_teardown(clean=False):
-    """
-    Stops and removes all containers, networks, volumes.
-    --clean also deletes generated config files.
-    """
     print_step("swiftdeploy teardown — removing stack")
-
     run("docker compose down --volumes --remove-orphans")
     print("✅ Containers, networks and volumes removed")
 
@@ -335,19 +797,15 @@ def cmd_teardown(clean=False):
             if os.path.exists(f):
                 os.remove(f)
                 print(f"✅ Deleted {f}")
-        print("✅ Generated configs cleaned up")
 
+    append_history("teardown", {"clean": clean})
     print("\n✅ Teardown complete")
 
 # ─────────────────────────────────────────
-# ENTRYPOINT — reads CLI argument
+# ENTRYPOINT
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
-    # sys.argv is the list of arguments passed to the script
-    # sys.argv[0] = "./swiftdeploy"
-    # sys.argv[1] = "init" / "validate" / "deploy" etc.
-
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
@@ -365,6 +823,10 @@ if __name__ == "__main__":
             print("❌ Usage: ./swiftdeploy promote [canary|stable]")
             sys.exit(1)
         cmd_promote(sys.argv[2])
+    elif command == "status":
+        cmd_status()
+    elif command == "audit":
+        cmd_audit()
     elif command == "teardown":
         clean = "--clean" in sys.argv
         cmd_teardown(clean)
